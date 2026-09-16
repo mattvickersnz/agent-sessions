@@ -1,0 +1,1543 @@
+#!/usr/bin/env python3
+"""Resume agent sessions or park and restore a complete iTerm2 tab layout."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, replace
+from typing import Iterable
+
+
+DEFAULT_DAYS = 30
+DEFAULT_LIMIT = 200
+MAX_CLAUDE_HEAD_BYTES = 2 * 1024 * 1024
+MAX_RECENT_TAIL_BYTES = 4 * 1024 * 1024
+SNAPSHOT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class Session:
+    agent: str
+    session_id: str
+    cwd: str
+    title: str
+    latest: str
+    updated_ms: int
+    active: bool = False
+
+    @property
+    def key(self) -> str:
+        return f"{self.agent}:{self.session_id}"
+
+
+def clean_text(value: object, limit: int = 140) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value
+    for tag in (
+        "local-command-caveat",
+        "system-reminder",
+        "environment_context",
+        "task-notification",
+    ):
+        text = re.sub(
+            rf"<{tag}(?:\s[^>]*)?>.*?</{tag}>",
+            " ",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+    text = re.sub(r"</?[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def message_text(message: object) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return clean_text(content)
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") in {
+            "text",
+            "input_text",
+            "output_text",
+        }:
+            text = item.get("text") or item.get("input_text") or item.get("output_text")
+            if isinstance(text, str):
+                parts.append(text)
+    return clean_text(" ".join(parts))
+
+
+def reverse_json_lines(path: Path) -> Iterable[dict[str, object]]:
+    """Yield recent JSONL records newest-first without reading a huge session whole."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            remaining = min(position, MAX_RECENT_TAIL_BYTES)
+            partial = b""
+            while remaining > 0:
+                chunk_size = min(64 * 1024, remaining)
+                position -= chunk_size
+                handle.seek(position)
+                partial = handle.read(chunk_size) + partial
+                remaining -= chunk_size
+                lines = partial.split(b"\n")
+                partial = lines[0]
+                for raw_line in reversed(lines[1:]):
+                    if not raw_line:
+                        continue
+                    try:
+                        record = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if isinstance(record, dict):
+                        yield record
+            if position == 0 and partial:
+                try:
+                    record = json.loads(partial)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return
+                if isinstance(record, dict):
+                    yield record
+    except OSError:
+        return
+
+
+def latest_claude_prompt(path: Path) -> str:
+    for record in reverse_json_lines(path):
+        if (
+            record.get("type") == "user"
+            and not record.get("isMeta")
+            and isinstance(record.get("message"), dict)
+        ):
+            text = message_text(record.get("message"))
+            if text:
+                return text
+    return ""
+
+
+def latest_codex_prompt(path: Path) -> str:
+    for record in reverse_json_lines(path):
+        payload = record.get("payload")
+        if (
+            record.get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        ):
+            text = message_text(payload)
+            if text:
+                return text
+    return ""
+
+
+def read_claude_session(path: Path) -> Session | None:
+    session_id = path.stem
+    cwd = ""
+    slug = ""
+    title = ""
+    is_sidechain = False
+    entrypoint = ""
+    bytes_read = 0
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle):
+                bytes_read += len(line.encode("utf-8", errors="ignore"))
+                if line_number >= 500 or bytes_read > MAX_CLAUDE_HEAD_BYTES:
+                    break
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                session_id = str(record.get("sessionId") or session_id)
+                cwd = str(record.get("cwd") or cwd)
+                slug = str(record.get("slug") or slug)
+                is_sidechain = bool(record.get("isSidechain", is_sidechain))
+                entrypoint = str(record.get("entrypoint") or entrypoint)
+
+                if (
+                    not title
+                    and record.get("type") == "user"
+                    and not record.get("isMeta")
+                ):
+                    title = message_text(record.get("message"))
+                if cwd and title:
+                    break
+    except (OSError, UnicodeError):
+        return None
+
+    if is_sidechain or entrypoint == "sdk-cli" or not cwd or not session_id:
+        return None
+    if not title:
+        title = slug.replace("-", " ") if slug else "Untitled session"
+    return Session(
+        agent="Claude",
+        session_id=session_id,
+        cwd=cwd,
+        title=clean_text(title),
+        latest=latest_claude_prompt(path) or clean_text(title),
+        updated_ms=int(path.stat().st_mtime * 1000),
+    )
+
+
+def load_claude_sessions(since_ms: int, scan_limit: int) -> list[Session]:
+    projects = Path.home() / ".claude" / "projects"
+    if not projects.is_dir():
+        return []
+
+    candidates: list[tuple[float, Path]] = []
+    for project_dir in projects.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for path in project_dir.glob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if int(mtime * 1000) >= since_ms:
+                candidates.append((mtime, path))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    sessions: list[Session] = []
+    for _, path in candidates[:scan_limit]:
+        session = read_claude_session(path)
+        if session is not None:
+            sessions.append(session)
+    return sessions
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+
+
+def load_codex_title_index(root: Path) -> dict[str, tuple[str, int]]:
+    index: dict[str, tuple[str, int]] = {}
+    path = root / "session_index.jsonl"
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    session_id = str(record.get("id") or "")
+                    timestamp = record.get("updated_at")
+                    updated_ms = iso_to_ms(timestamp) if timestamp else 0
+                    if session_id:
+                        index[session_id] = (
+                            clean_text(record.get("thread_name")),
+                            updated_ms,
+                        )
+                except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
+                    continue
+    except OSError:
+        pass
+    return index
+
+
+def iso_to_ms(value: object) -> int:
+    if not isinstance(value, str):
+        return 0
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(parsed.timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def load_codex_from_database(root: Path, since_ms: int) -> list[Session]:
+    database = root / "state_5.sqlite"
+    if not database.is_file():
+        return []
+
+    uri = f"file:{database}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=0.25)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, cwd, title, first_user_message, source, rollout_path,
+                   updated_at, updated_at_ms, agent_nickname, agent_role, archived
+              FROM threads
+             WHERE archived = 0
+               AND source != 'exec'
+               AND source NOT LIKE '{%'
+               AND agent_nickname IS NULL
+               AND agent_role IS NULL
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    sessions: list[Session] = []
+    for row in rows:
+        updated_ms = int(row["updated_at_ms"] or int(row["updated_at"] or 0) * 1000)
+        rollout_path = Path(str(row["rollout_path"] or ""))
+        try:
+            updated_ms = max(updated_ms, int(rollout_path.stat().st_mtime * 1000))
+        except OSError:
+            pass
+        if updated_ms < since_ms:
+            continue
+        cwd = str(row["cwd"] or "")
+        session_id = str(row["id"] or "")
+        if not cwd or not session_id:
+            continue
+        title = clean_text(row["title"] or row["first_user_message"])
+        sessions.append(
+            Session(
+                agent="Codex",
+                session_id=session_id,
+                cwd=cwd,
+                title=title or "Untitled session",
+                latest=latest_codex_prompt(rollout_path) or title or "Untitled session",
+                updated_ms=updated_ms,
+            )
+        )
+    return sessions
+
+
+def load_codex_from_rollouts(root: Path, since_ms: int) -> list[Session]:
+    sessions_dir = root / "sessions"
+    if not sessions_dir.is_dir():
+        return []
+    titles = load_codex_title_index(root)
+    sessions: list[Session] = []
+
+    for path in sessions_dir.glob("*/*/*/*.jsonl"):
+        try:
+            mtime_ms = int(path.stat().st_mtime * 1000)
+        except OSError:
+            continue
+        title_entry = titles.get(path.stem.rsplit("-", 5)[-1], ("", 0))
+        updated_ms = max(mtime_ms, title_entry[1])
+        if updated_ms < since_ms:
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                first = json.loads(handle.readline())
+            if first.get("type") != "session_meta":
+                continue
+            payload = first.get("payload") or {}
+            source = payload.get("source")
+            if source == "exec" or isinstance(source, dict):
+                continue
+            session_id = str(payload.get("id") or "")
+            cwd = str(payload.get("cwd") or "")
+            if not session_id or not cwd:
+                continue
+            title, index_ms = titles.get(session_id, ("", 0))
+            sessions.append(
+                Session(
+                    agent="Codex",
+                    session_id=session_id,
+                    cwd=cwd,
+                    title=title or "Untitled session",
+                    latest=latest_codex_prompt(path) or title or "Untitled session",
+                    updated_ms=max(mtime_ms, index_ms),
+                )
+            )
+        except (OSError, AttributeError, json.JSONDecodeError):
+            continue
+    return sessions
+
+
+def load_codex_sessions(since_ms: int) -> list[Session]:
+    root = codex_home()
+    try:
+        sessions = load_codex_from_database(root, since_ms)
+        if sessions:
+            return sessions
+    except (OSError, sqlite3.Error, ValueError):
+        pass
+    return load_codex_from_rollouts(root, since_ms)
+
+
+ITERM_SESSIONS_APPLESCRIPT = r'''
+set fieldSeparator to ASCII character 9
+set outputText to ""
+tell application "iTerm2"
+  repeat with terminalWindow in windows
+    repeat with terminalTab in tabs of terminalWindow
+      repeat with terminalSession in sessions of terminalTab
+        set pathValue to ""
+        try
+          tell terminalSession to set pathValue to variable named "session.path"
+        end try
+        tell terminalSession
+          set outputText to outputText & tty & fieldSeparator & pathValue & linefeed
+        end tell
+      end repeat
+    end repeat
+  end repeat
+end tell
+return outputText
+'''.strip()
+
+
+ITERM_SNAPSHOT_APPLESCRIPT = r'''
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+set outputText to ""
+set windowNumber to 0
+tell application "iTerm2"
+  repeat with terminalWindow in windows
+    set windowNumber to windowNumber + 1
+    set tabNumber to 0
+    repeat with terminalTab in tabs of terminalWindow
+      set tabNumber to tabNumber + 1
+      set tabTitle to title of terminalTab as text
+      set sessionCount to count of sessions of terminalTab
+      repeat with terminalSession in sessions of terminalTab
+        set pathValue to ""
+        set jobValue to ""
+        set promptValue to "false"
+        try
+          tell terminalSession to set pathValue to variable named "session.path"
+        end try
+        try
+          tell terminalSession to set jobValue to variable named "session.jobName"
+        end try
+        try
+          tell terminalSession to set promptValue to is at shell prompt as text
+        end try
+        tell terminalSession
+          set outputText to outputText & windowNumber & fieldSeparator & tabNumber & fieldSeparator & tabTitle & fieldSeparator & sessionCount & fieldSeparator & unique ID & fieldSeparator & tty & fieldSeparator & name & fieldSeparator & pathValue & fieldSeparator & promptValue & fieldSeparator & jobValue & fieldSeparator & profile name & recordSeparator
+        end tell
+      end repeat
+    end repeat
+  end repeat
+end tell
+return outputText
+'''.strip()
+
+
+def process_table() -> dict[int, tuple[str, str]]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,tty=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+
+    processes: dict[int, tuple[str, str]] = {}
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        tty = parts[1]
+        if tty != "??" and not tty.startswith("/dev/"):
+            tty = "/dev/" + tty
+        processes[pid] = (tty, parts[2])
+    return processes
+
+
+def command_basename(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    return os.path.basename(parts[0]) if parts else ""
+
+
+def default_snapshot_path() -> Path:
+    state_root = Path(
+        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+    ).expanduser()
+    return state_root / "agent-sessions" / "last.json"
+
+
+def command_history_path(unique_id: str) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9-]+", unique_id):
+        return None
+    state_root = Path(
+        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+    ).expanduser()
+    return state_root / "agent-sessions" / "commands" / (unique_id + ".log")
+
+
+def recent_terminal_commands(unique_id: str, limit: int = 5) -> list[str]:
+    path = command_history_path(unique_id)
+    if path is None:
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    return [line for line in lines if line.strip()][-limit:]
+
+
+def capture_iterm_rows() -> list[dict[str, object]]:
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", ITERM_SNAPSHOT_APPLESCRIPT],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"could not inspect iTerm2: {error}") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "iTerm2 automation failed"
+        raise RuntimeError(detail)
+
+    rows: list[dict[str, object]] = []
+    for raw_record in completed.stdout.split("\x1e"):
+        raw_record = raw_record.strip("\r\n")
+        if not raw_record:
+            continue
+        fields = raw_record.split("\x1f")
+        if len(fields) != 11:
+            continue
+        try:
+            window_number = int(fields[0])
+            tab_number = int(fields[1])
+            session_count = int(fields[3])
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "window": window_number,
+                "tab": tab_number,
+                "title": fields[2],
+                "session_count": session_count,
+                "unique_id": fields[4],
+                "tty": fields[5],
+                "name": fields[6],
+                "cwd": fields[7],
+                "is_at_shell_prompt": fields[8].casefold() == "true",
+                "job": fields[9],
+                "profile": fields[10],
+            }
+        )
+    return rows
+
+
+def live_agent_sessions_by_tty(
+    processes: dict[int, tuple[str, str]], open_ttys: set[str]
+) -> dict[str, tuple[str, str]]:
+    agents: dict[str, tuple[str, str]] = {}
+
+    registry = Path.home() / ".claude" / "sessions"
+    if registry.is_dir():
+        for path in registry.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                pid = int(record.get("pid"))
+                session_id = str(record.get("sessionId") or "")
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            process = processes.get(pid)
+            if (
+                process
+                and process[0] in open_ttys
+                and command_basename(process[1]) == "claude"
+                and session_id
+            ):
+                agents[process[0]] = ("Claude", session_id)
+
+    codex_pids = [
+        pid
+        for pid, (tty, command) in processes.items()
+        if tty in open_ttys and command_basename(command) == "codex"
+    ]
+    if not codex_pids:
+        return agents
+
+    try:
+        completed = subprocess.run(
+            ["lsof", "-Fpn", "-p", ",".join(str(pid) for pid in codex_pids)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return agents
+
+    known_codex_ids = {session.session_id for session in load_codex_sessions(0)}
+    ids_by_pid: dict[int, list[str]] = {}
+    current_pid = 0
+    rollout_pattern = re.compile(r"rollout-.*-([0-9a-f-]{36})\.jsonl$")
+    for line in completed.stdout.splitlines():
+        if line.startswith("p"):
+            try:
+                current_pid = int(line[1:])
+            except ValueError:
+                current_pid = 0
+            continue
+        if not line.startswith("n") or "/.codex/sessions/" not in line:
+            continue
+        match = rollout_pattern.search(line[1:])
+        if match and match.group(1) in known_codex_ids:
+            ids_by_pid.setdefault(current_pid, []).append(match.group(1))
+
+    for pid in codex_pids:
+        process = processes.get(pid)
+        session_ids = ids_by_pid.get(pid, [])
+        if process and session_ids:
+            agents[process[0]] = ("Codex", session_ids[0])
+    return agents
+
+
+def classify_terminal(row: dict[str, object]) -> str:
+    job = os.path.basename(str(row.get("job") or "")).casefold()
+    name = str(row.get("name") or "").casefold()
+    shells = {"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh"}
+    if job in shells or any(name.startswith(prefix) for prefix in ("-zsh", "-bash", "-fish")):
+        return "shell"
+    return "service"
+
+
+def build_iterm_snapshot() -> dict[str, object]:
+    rows = capture_iterm_rows()
+    processes = process_table()
+    agent_by_tty = live_agent_sessions_by_tty(
+        processes, {str(row["tty"]) for row in rows if row.get("tty")}
+    )
+
+    tabs_by_key: dict[tuple[int, int], dict[str, object]] = {}
+    for row in rows:
+        key = (int(row["window"]), int(row["tab"]))
+        tab = tabs_by_key.setdefault(
+            key,
+            {
+                "window": row["window"],
+                "tab": row["tab"],
+                "title": row["title"],
+                "sessions": [],
+            },
+        )
+        tty = str(row.get("tty") or "")
+        agent = agent_by_tty.get(tty)
+        kind = "agent" if agent else classify_terminal(row)
+        session = {
+            "unique_id": row["unique_id"],
+            "tty": tty,
+            "cwd": row["cwd"],
+            "profile": row["profile"],
+            "name": row["name"],
+            "job": row["job"],
+            "is_at_shell_prompt": row["is_at_shell_prompt"],
+            "kind": kind,
+            "recent_commands": recent_terminal_commands(str(row["unique_id"])),
+        }
+        if agent:
+            session["agent"] = agent[0]
+            session["agent_session_id"] = agent[1]
+        sessions = tab["sessions"]
+        assert isinstance(sessions, list)
+        sessions.append(session)
+
+    return {
+        "version": SNAPSHOT_VERSION,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": "iTerm2",
+        "tabs": list(tabs_by_key.values()),
+    }
+
+
+def write_snapshot(snapshot: dict[str, object], path: Path) -> None:
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            json.dump(snapshot, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def read_snapshot(path: Path) -> dict[str, object]:
+    try:
+        snapshot = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"could not read snapshot {path}: {error}") from error
+    if not isinstance(snapshot, dict) or snapshot.get("version") != SNAPSHOT_VERSION:
+        raise RuntimeError(f"unsupported snapshot format in {path}")
+    if not isinstance(snapshot.get("tabs"), list):
+        raise RuntimeError(f"invalid snapshot in {path}: tabs are missing")
+    return snapshot
+
+
+def snapshot_entries(snapshot: dict[str, object]) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    tabs = snapshot.get("tabs")
+    if not isinstance(tabs, list):
+        return entries
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            continue
+        sessions = tab.get("sessions")
+        if not isinstance(sessions, list):
+            continue
+        for index, session in enumerate(sessions, start=1):
+            if not isinstance(session, dict):
+                continue
+            entry = dict(session)
+            title = str(tab.get("title") or "Terminal")
+            if len(sessions) > 1:
+                title = f"{title} ({index}/{len(sessions)})"
+            entry["title"] = title
+            entry["window"] = tab.get("window")
+            entry["tab"] = tab.get("tab")
+            entries.append(entry)
+    return entries
+
+
+def snapshot_counts(snapshot: dict[str, object]) -> tuple[int, int, int, int]:
+    entries = snapshot_entries(snapshot)
+    return (
+        len(snapshot.get("tabs", [])),
+        sum(entry.get("kind") == "agent" for entry in entries),
+        sum(entry.get("kind") == "shell" for entry in entries),
+        sum(entry.get("kind") == "service" for entry in entries),
+    )
+
+
+def print_snapshot_summary(snapshot: dict[str, object], *, verb: str) -> None:
+    tabs, agents, shells, services = snapshot_counts(snapshot)
+    print(
+        f"{verb}: {tabs} tabs · {agents} agents · {shells} shells · "
+        f"{services} service/other"
+    )
+
+
+def build_snapshot_command(entry: dict[str, object]) -> str:
+    cwd = str(entry.get("cwd") or Path.home())
+    if not Path(cwd).is_dir():
+        cwd = str(Path.home())
+    change_directory = f"cd -- {shlex.quote(cwd)}"
+    if entry.get("kind") != "agent":
+        return change_directory
+    agent = str(entry.get("agent") or "")
+    session_id = str(entry.get("agent_session_id") or "")
+    if not session_id:
+        return change_directory
+    if agent == "Claude":
+        return f"{change_directory} && claude --resume {shlex.quote(session_id)}"
+    if agent == "Codex":
+        return f"{change_directory} && codex resume {shlex.quote(session_id)}"
+    return change_directory
+
+
+def build_recent_commands_output(entry: dict[str, object]) -> str:
+    value = entry.get("recent_commands")
+    if not isinstance(value, list):
+        return ""
+    commands = [str(command) for command in value if str(command).strip()][-5:]
+    if not commands:
+        return ""
+    arguments = " ".join(shlex.quote("  " + command) for command in commands)
+    return (
+        "printf '\\n\\033[2mRecent commands before park:\\033[0m\\n'; "
+        f"printf '%s\\n' {arguments}; printf '\\n'"
+    )
+
+
+def open_iterm_terminals() -> list[tuple[str, str]]:
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", ITERM_SESSIONS_APPLESCRIPT],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+
+    terminals: list[tuple[str, str]] = []
+    for line in completed.stdout.splitlines():
+        tty, separator, cwd = line.partition("\t")
+        if separator and tty:
+            terminals.append((tty, cwd))
+    return terminals
+
+
+def live_claude_sessions(
+    processes: dict[int, tuple[str, str]], open_ttys: set[str]
+) -> tuple[set[str], set[tuple[str, str]]]:
+    active_ids: set[str] = set()
+    exact_directories: set[tuple[str, str]] = set()
+    registry = Path.home() / ".claude" / "sessions"
+    if not registry.is_dir():
+        return active_ids, exact_directories
+
+    for path in registry.glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(record.get("pid"))
+            session_id = str(record.get("sessionId") or "")
+            cwd = str(record.get("cwd") or "")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        process = processes.get(pid)
+        if (
+            not process
+            or process[0] not in open_ttys
+            or command_basename(process[1]) != "claude"
+            or not session_id
+        ):
+            continue
+        active_ids.add("Claude:" + session_id)
+        if cwd:
+            exact_directories.add(("Claude", os.path.realpath(cwd)))
+    return active_ids, exact_directories
+
+
+def live_codex_sessions(
+    processes: dict[int, tuple[str, str]],
+    open_ttys: set[str],
+    terminals: list[tuple[str, str]],
+) -> tuple[set[str], set[tuple[str, str]]]:
+    codex_pids = [
+        pid
+        for pid, (tty, command) in processes.items()
+        if tty in open_ttys and command_basename(command) == "codex"
+    ]
+    if not codex_pids:
+        return set(), set()
+
+    try:
+        completed = subprocess.run(
+            ["lsof", "-Fpn", "-p", ",".join(str(pid) for pid in codex_pids)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set(), set()
+
+    active_ids: set[str] = set()
+    exact_directories: set[tuple[str, str]] = set()
+    current_pid = 0
+    rollout_pattern = re.compile(r"rollout-.*-([0-9a-f-]{36})\.jsonl$")
+    for line in completed.stdout.splitlines():
+        if line.startswith("p"):
+            try:
+                current_pid = int(line[1:])
+            except ValueError:
+                current_pid = 0
+            continue
+        if not line.startswith("n") or "/.codex/sessions/" not in line:
+            continue
+        match = rollout_pattern.search(line[1:])
+        if not match:
+            continue
+        active_ids.add("Codex:" + match.group(1))
+        process = processes.get(current_pid)
+        if process:
+            tty = process[0]
+            for terminal_tty, cwd in terminals:
+                if terminal_tty == tty and cwd:
+                    exact_directories.add(("Codex", os.path.realpath(cwd)))
+    return active_ids, exact_directories
+
+
+def mark_active_sessions(sessions: list[Session]) -> list[Session]:
+    processes = process_table()
+    iterm_running = any(
+        command_basename(command) == "iTerm2" and "/iTerm.app/" in command
+        for _, command in processes.values()
+    )
+    if not iterm_running:
+        return sessions
+    terminals = open_iterm_terminals()
+    if not terminals:
+        return sessions
+    open_ttys = {tty for tty, _ in terminals}
+
+    claude_ids, claude_exact_dirs = live_claude_sessions(processes, open_ttys)
+    codex_ids, codex_exact_dirs = live_codex_sessions(processes, open_ttys, terminals)
+    active_ids = claude_ids | codex_ids
+    exact_dirs = claude_exact_dirs | codex_exact_dirs
+
+    fallback_dirs: set[tuple[str, str]] = set()
+    pids_by_tty: dict[str, list[str]] = {}
+    for tty, command in processes.values():
+        if tty in open_ttys:
+            pids_by_tty.setdefault(tty, []).append(command_basename(command))
+    for tty, cwd in terminals:
+        if not cwd:
+            continue
+        agents = pids_by_tty.get(tty, [])
+        real_cwd = os.path.realpath(cwd)
+        if "claude" in agents and ("Claude", real_cwd) not in exact_dirs:
+            fallback_dirs.add(("Claude", real_cwd))
+        if "codex" in agents and ("Codex", real_cwd) not in exact_dirs:
+            fallback_dirs.add(("Codex", real_cwd))
+
+    return [
+        replace(
+            session,
+            active=(
+                session.key in active_ids
+                or (session.agent, os.path.realpath(session.cwd)) in fallback_dirs
+            ),
+        )
+        for session in sessions
+    ]
+
+
+def relative_age(updated_ms: int) -> str:
+    delta = max(0, int(dt.datetime.now().timestamp() - updated_ms / 1000))
+    if delta < 60:
+        return "now"
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86400:
+        return f"{delta // 3600}h"
+    if delta < 86400 * 7:
+        return f"{delta // 86400}d"
+    return dt.datetime.fromtimestamp(updated_ms / 1000).strftime("%d %b")
+
+
+def short_home(path: str) -> str:
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home) :]
+    return path
+
+
+def clipped(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value.ljust(width)
+    if width == 1:
+        return "…"
+    return value[: width - 1] + "…"
+
+
+def matching(sessions: Iterable[Session], query: str) -> list[Session]:
+    words = query.casefold().split()
+    if not words:
+        return list(sessions)
+    result: list[Session] = []
+    for session in sessions:
+        state = "open active live" if session.active else "closed"
+        haystack = " ".join(
+            (
+                session.agent,
+                session.cwd,
+                session.title,
+                session.latest,
+                session.session_id,
+                state,
+            )
+        ).casefold()
+        if all(word in haystack for word in words):
+            result.append(session)
+    return result
+
+
+def draw_picker(
+    screen: curses.window, sessions: list[Session]
+) -> list[Session]:
+    curses.curs_set(0)
+    screen.keypad(True)
+    try:
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    except curses.error:
+        pass
+
+    selected: set[str] = set()
+    query = ""
+    filtering = False
+    cursor = 0
+    top = 0
+
+    while True:
+        visible = matching(sessions, query)
+        height, width = screen.getmaxyx()
+        rows_height = max(1, (height - 5) // 2)
+        cursor = max(0, min(cursor, len(visible) - 1)) if visible else 0
+        if cursor < top:
+            top = cursor
+        if cursor >= top + rows_height:
+            top = cursor - rows_height + 1
+
+        screen.erase()
+        title = "Agent sessions  ● open in iTerm2"
+        help_text = "Space select  Enter open tabs  / search  a all  c clear  q quit"
+        try:
+            screen.addnstr(0, 0, title, width - 1, curses.A_BOLD | curses.color_pair(1))
+            screen.addnstr(1, 0, help_text, width - 1)
+            prompt = f"Search: {query}"
+            if filtering:
+                prompt += "▌"
+            screen.addnstr(2, 0, prompt, width - 1, curses.color_pair(4) if query else 0)
+
+            age_w, agent_w = 7, 7
+            metadata_w = max(24, min(44, width // 3))
+            content_w = max(1, width - metadata_w - 3)
+            header = (
+                clipped("SESSION", metadata_w)
+                + " │ "
+                + clipped("CONTENT", content_w)
+            )
+            screen.addnstr(3, 0, header, width - 1, curses.A_DIM)
+
+            for row_number, session in enumerate(visible[top : top + rows_height]):
+                absolute_index = top + row_number
+                marker = "[✓]" if session.key in selected else "[ ]"
+                live_marker = "●" if session.active else " "
+                metadata_top = (
+                    f"{marker} {live_marker} "
+                    + clipped(relative_age(session.updated_ms), age_w)
+                    + " "
+                    + clipped(session.agent, agent_w)
+                )
+                directory = "    " + short_home(session.cwd)
+                first_row = (
+                    clipped(metadata_top, metadata_w)
+                    + " │ "
+                    + clipped("First  " + session.title, content_w)
+                )
+                last_row = (
+                    clipped(directory, metadata_w)
+                    + " │ "
+                    + clipped("Last   " + session.latest, content_w)
+                )
+                style = curses.color_pair(2) if absolute_index == cursor else 0
+                if session.key in selected and absolute_index != cursor:
+                    style |= curses.color_pair(3)
+                elif session.active and absolute_index != cursor:
+                    style |= curses.color_pair(5) | curses.A_BOLD
+                screen_row = 4 + row_number * 2
+                screen.addnstr(screen_row, 0, first_row, width - 1, style)
+                screen.addnstr(screen_row + 1, 0, last_row, width - 1, style)
+
+            active_count = sum(session.active for session in visible)
+            footer = (
+                f"{len(visible)} shown · {active_count} open · "
+                f"{len(selected)} selected"
+            )
+            screen.addnstr(height - 1, 0, footer, width - 1, curses.A_DIM)
+            screen.refresh()
+        except curses.error:
+            pass
+
+        key = screen.get_wch()
+        if filtering:
+            if key in ("\n", "\r", curses.KEY_ENTER, "\x1b"):
+                filtering = False
+                curses.curs_set(0)
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                query = query[:-1]
+                cursor = top = 0
+            elif isinstance(key, str) and key.isprintable():
+                query += key
+                cursor = top = 0
+            continue
+
+        if key in ("q", "Q", "\x1b"):
+            return []
+        if key == "/":
+            filtering = True
+            curses.curs_set(1)
+        elif key in (curses.KEY_UP, "k"):
+            cursor = max(0, cursor - 1)
+        elif key in (curses.KEY_DOWN, "j"):
+            cursor = min(max(0, len(visible) - 1), cursor + 1)
+        elif key == curses.KEY_PPAGE:
+            cursor = max(0, cursor - rows_height)
+        elif key == curses.KEY_NPAGE:
+            cursor = min(max(0, len(visible) - 1), cursor + rows_height)
+        elif key == " " and visible:
+            session_key = visible[cursor].key
+            if session_key in selected:
+                selected.remove(session_key)
+            else:
+                selected.add(session_key)
+            cursor = min(len(visible) - 1, cursor + 1)
+        elif key in ("a", "A"):
+            visible_keys = {session.key for session in visible}
+            if visible_keys and visible_keys.issubset(selected):
+                selected -= visible_keys
+            else:
+                selected |= visible_keys
+        elif key in ("c", "C"):
+            selected.clear()
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            if not visible:
+                continue
+            wanted = selected or {visible[cursor].key}
+            return [session for session in sessions if session.key in wanted]
+
+
+def pick_sessions(sessions: list[Session]) -> list[Session]:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("interactive selection needs a terminal; use --list or --json")
+    return curses.wrapper(draw_picker, sessions)
+
+
+def build_resume_command(session: Session) -> str:
+    directory = shlex.quote(session.cwd)
+    session_id = shlex.quote(session.session_id)
+    if session.agent == "Claude":
+        resume = f"claude --resume {session_id}"
+    else:
+        resume = f"codex resume {session_id}"
+    return f"cd -- {directory} && {resume}"
+
+
+ITERM_APPLESCRIPT = r'''
+on run argv
+  tell application "iTerm2"
+    activate
+    if (count of windows) is 0 then
+      create window with default profile
+    end if
+    set targetWindow to current window
+    repeat with commandText in argv
+      set commandString to commandText as text
+      tell targetWindow
+        set newTab to (create tab with default profile)
+        tell current session of newTab to write text commandString
+      end tell
+    end repeat
+  end tell
+end run
+'''.strip()
+
+
+ITERM_RESTORE_APPLESCRIPT = r'''
+on run argv
+  tell application "iTerm2"
+    activate
+    set argumentCount to count of argv
+    set argumentIndex to 1
+    repeat while argumentIndex <= argumentCount
+      set titleText to item argumentIndex of argv as text
+      set profileText to item (argumentIndex + 1) of argv as text
+      set commandText to item (argumentIndex + 2) of argv as text
+      if (count of windows) is 0 then
+        try
+          set targetWindow to (create window with profile profileText)
+        on error
+          set targetWindow to (create window with default profile)
+        end try
+        set newTab to current tab of targetWindow
+      else
+        set targetWindow to current window
+        tell targetWindow
+          try
+            set newTab to (create tab with profile profileText)
+          on error
+            set newTab to (create tab with default profile)
+          end try
+        end tell
+      end if
+      delay 0.35
+      tell current session of newTab to write text commandText
+      set argumentIndex to argumentIndex + 3
+    end repeat
+  end tell
+end run
+'''.strip()
+
+
+ITERM_CLOSE_APPLESCRIPT = r'''
+on run argv
+  delay 0.8
+  tell application "iTerm2"
+    repeat with sessionIdText in argv
+      set wantedId to sessionIdText as text
+      set targetTab to missing value
+      repeat with terminalWindow in windows
+        repeat with terminalTab in tabs of terminalWindow
+          repeat with terminalSession in sessions of terminalTab
+            if (unique ID of terminalSession as text) is wantedId then
+              set targetTab to terminalTab
+              exit repeat
+            end if
+          end repeat
+          if targetTab is not missing value then exit repeat
+        end repeat
+        if targetTab is not missing value then exit repeat
+      end repeat
+      if targetTab is not missing value then close targetTab
+    end repeat
+  end tell
+end run
+'''.strip()
+
+
+def open_iterm_tabs(sessions: list[Session], dry_run: bool) -> int:
+    runnable: list[Session] = []
+    for session in sessions:
+        if not Path(session.cwd).is_dir():
+            print(
+                f"agent-sessions: skipping {session.agent} {session.session_id}: "
+                f"directory no longer exists: {session.cwd}",
+                file=sys.stderr,
+            )
+            continue
+        runnable.append(session)
+
+    commands = [build_resume_command(session) for session in runnable]
+    if dry_run:
+        for command in commands:
+            print(command)
+        return 0
+    if not commands:
+        return 1
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", ITERM_APPLESCRIPT, *commands], check=False
+        )
+    except OSError as error:
+        print(f"agent-sessions: could not start iTerm2: {error}", file=sys.stderr)
+        return 1
+    if completed.returncode != 0:
+        print(
+            "agent-sessions: iTerm2 automation failed. "
+            "Check System Settings → Privacy & Security → Automation.",
+            file=sys.stderr,
+        )
+    return completed.returncode
+
+
+def restore_snapshot(snapshot: dict[str, object], dry_run: bool) -> int:
+    entries = snapshot_entries(snapshot)
+    if not entries:
+        print("agent-sessions: the snapshot contains no terminal sessions", file=sys.stderr)
+        return 1
+
+    arguments: list[str] = []
+    for entry in entries:
+        title = str(entry.get("title") or "Terminal")
+        profile = str(entry.get("profile") or "Default")
+        resume_command = build_snapshot_command(entry)
+        recent_commands_output = build_recent_commands_output(entry)
+        title_command = (
+            "printf '\\033]1;%s\\007' " + shlex.quote(title)
+        )
+        command_parts = [": __agent_sessions_restore__", title_command]
+        if recent_commands_output:
+            command_parts.append(recent_commands_output)
+        command_parts.append(resume_command)
+        command = "; ".join(command_parts)
+        if dry_run:
+            kind = str(entry.get("kind") or "terminal")
+            print(f"[{kind:<7}] {title}: {resume_command}")
+            recent = entry.get("recent_commands")
+            if isinstance(recent, list):
+                for previous_command in recent[-5:]:
+                    print(f"          · {previous_command}")
+        arguments.extend((title, profile, command))
+    if dry_run:
+        return 0
+
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", ITERM_RESTORE_APPLESCRIPT, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        print(f"agent-sessions: could not start iTerm2: {error}", file=sys.stderr)
+        return 1
+    if completed.returncode != 0:
+        print(
+            "agent-sessions: iTerm2 automation failed. "
+            "Check System Settings → Privacy & Security → Automation.",
+            file=sys.stderr,
+        )
+    return completed.returncode
+
+
+def current_iterm_unique_id() -> str:
+    value = os.environ.get("ITERM_SESSION_ID") or os.environ.get("TERM_SESSION_ID") or ""
+    return value.rsplit(":", 1)[-1] if ":" in value else value
+
+
+def close_snapshot_tabs(snapshot: dict[str, object]) -> int:
+    tab_ids: list[str] = []
+    tabs = snapshot.get("tabs")
+    if isinstance(tabs, list):
+        for tab in tabs:
+            if not isinstance(tab, dict):
+                continue
+            sessions = tab.get("sessions")
+            if not isinstance(sessions, list) or not sessions:
+                continue
+            first_session = sessions[0]
+            if isinstance(first_session, dict) and first_session.get("unique_id"):
+                tab_ids.append(str(first_session["unique_id"]))
+
+    current_id = current_iterm_unique_id()
+    if current_id in tab_ids:
+        tab_ids.remove(current_id)
+        tab_ids.append(current_id)
+    if not tab_ids:
+        return 1
+
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", ITERM_CLOSE_APPLESCRIPT, *tab_ids],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        print(f"agent-sessions: could not close iTerm2 tabs: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def confirm_park(snapshot: dict[str, object]) -> bool:
+    if not sys.stdin.isatty():
+        print("agent-sessions: park needs a terminal or --yes", file=sys.stderr)
+        return False
+    _, agents, shells, services = snapshot_counts(snapshot)
+    print(
+        f"This will close {agents} agent, {shells} shell, and {services} "
+        "service/other terminal sessions."
+    )
+    if services:
+        print("Services will stop; restore reopens their tabs in the saved directories only.")
+    try:
+        answer = input("Save this layout and close all captured iTerm2 tabs? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer.strip().casefold() in {"y", "yes"}
+
+
+def print_sessions(sessions: list[Session]) -> None:
+    if not sessions:
+        print("No recent sessions found.")
+        return
+    metadata_w = 42
+    print(clipped("SESSION", metadata_w) + " │ CONTENT")
+    for session in sessions:
+        directory = short_home(session.cwd)
+        missing = " !" if not Path(session.cwd).is_dir() else ""
+        metadata_top = (
+            f"{'●' if session.active else ' '} "
+            f"{relative_age(session.updated_ms):<8} "
+            f"{session.agent:<7}"
+        )
+        print(clipped(metadata_top, metadata_w) + " │ First  " + session.title)
+        print(clipped("    " + directory + missing, metadata_w) + " │ Last   " + session.latest)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Resume recent Claude Code/Codex sessions, or save and restore a complete "
+            "iTerm2 tab layout."
+        )
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("pick", "save", "park", "close", "restore"),
+        default="pick",
+        help=(
+            "pick sessions (default), save the current iTerm2 layout, park/close all "
+            "tabs after saving, or restore the saved layout"
+        ),
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help=f"show sessions updated within N days (default: {DEFAULT_DAYS}; 0 means all)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"maximum sessions to show (default: {DEFAULT_LIMIT})",
+    )
+    parser.add_argument(
+        "--agent",
+        choices=("all", "claude", "codex"),
+        default="all",
+        help="only show sessions from one agent",
+    )
+    parser.add_argument("--list", action="store_true", help="print sessions and exit")
+    parser.add_argument("--json", action="store_true", help="print session metadata as JSON")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be saved, closed, or opened without changing anything",
+    )
+    parser.add_argument(
+        "--file",
+        type=Path,
+        default=default_snapshot_path(),
+        help="snapshot file for save/park/restore (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the confirmation before park/close",
+    )
+    args = parser.parse_args()
+    if args.days < 0:
+        parser.error("--days must be zero or greater")
+    if args.limit < 1:
+        parser.error("--limit must be greater than zero")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    args.file = args.file.expanduser().resolve()
+
+    if args.command == "restore":
+        try:
+            snapshot = read_snapshot(args.file)
+        except RuntimeError as error:
+            print(f"agent-sessions: {error}", file=sys.stderr)
+            return 1
+        print_snapshot_summary(snapshot, verb="Restoring")
+        return restore_snapshot(snapshot, args.dry_run)
+
+    if args.command in {"save", "park", "close"}:
+        try:
+            snapshot = build_iterm_snapshot()
+        except RuntimeError as error:
+            print(f"agent-sessions: {error}", file=sys.stderr)
+            return 1
+        if not snapshot.get("tabs"):
+            print("agent-sessions: no open iTerm2 tabs found", file=sys.stderr)
+            return 1
+
+        action = "Would save" if args.dry_run else "Captured"
+        print_snapshot_summary(snapshot, verb=action)
+        if args.dry_run:
+            if args.command == "save":
+                print(json.dumps(snapshot, indent=2))
+            else:
+                print(f"Would write snapshot to {args.file.expanduser()}")
+                print("Would close the captured tabs; the restore plan is:")
+                restore_snapshot(snapshot, True)
+            return 0
+
+        if args.command in {"park", "close"} and not args.yes and not confirm_park(snapshot):
+            print("Cancelled; no snapshot was written and no tabs were closed.")
+            return 1
+        try:
+            write_snapshot(snapshot, args.file)
+        except OSError as error:
+            print(f"agent-sessions: could not write snapshot {args.file}: {error}", file=sys.stderr)
+            return 1
+        print(f"Saved snapshot to {args.file.expanduser()}")
+        if args.command == "save":
+            return 0
+        print(f"Restore later with: agent-sessions restore --file {shlex.quote(str(args.file))}")
+        sys.stdout.flush()
+        return close_snapshot_tabs(snapshot)
+
+    now_ms = int(dt.datetime.now().timestamp() * 1000)
+    since_ms = 0 if args.days == 0 else now_ms - args.days * 86400 * 1000
+
+    sessions: list[Session] = []
+    if args.agent in ("all", "claude"):
+        sessions.extend(load_claude_sessions(since_ms, args.limit * 3))
+    if args.agent in ("all", "codex"):
+        sessions.extend(load_codex_sessions(since_ms))
+    sessions = mark_active_sessions(sessions)
+    sessions.sort(key=lambda session: session.updated_ms, reverse=True)
+    sessions = sessions[: args.limit]
+
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "agent": session.agent,
+                        "id": session.session_id,
+                        "cwd": session.cwd,
+                        "started": session.title,
+                        "latest": session.latest,
+                        "updated_ms": session.updated_ms,
+                        "active": session.active,
+                    }
+                    for session in sessions
+                ],
+                indent=2,
+            )
+        )
+        return 0
+    if args.list:
+        print_sessions(sessions)
+        return 0
+    if not sessions:
+        print("No recent Claude Code or Codex sessions found.", file=sys.stderr)
+        return 1
+    try:
+        selected = pick_sessions(sessions)
+    except (curses.error, RuntimeError) as error:
+        print(f"agent-sessions: {error}", file=sys.stderr)
+        return 1
+    if not selected:
+        return 0
+    return open_iterm_tabs(selected, args.dry_run)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
